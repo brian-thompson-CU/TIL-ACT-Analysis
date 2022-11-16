@@ -1,0 +1,321 @@
+---
+title: "TIL ACT ChIP-seq"
+output:
+  html_document: default
+  pdf_document: default
+date: "2022-10-19"
+fig_width: 8 
+fig_height: 8 
+---
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Volumes/2TB_SSD/TIL_Epigenome_Chip")
+```
+
+
+```{r install packages, include=FALSE}
+library(BiocManager)
+library(DiffBind)
+library(magrittr)
+library(dplyr)
+library(parallel)
+library(edgeR)
+library(EnhancedVolcano)
+library(package = "lattice")
+library(gplots)
+library(RColorBrewer)
+library(tidyr)
+library(stringr)
+library(chipenrich)
+library(ggpubr)
+library(survival)
+library(survminer)
+library(gtsummary)
+```
+
+## Once all packages are installed, the data can now be loaded in. 
+The data for diffbind consists of two main components which are contained within the peakset file: 
+1) the genomic location of the peaks called by MACS 
+2) the cleaned bam reads (which are used for library size normalization)
+
+```{r load data}
+TIL <- read.csv("diffbind/peakset_median.csv") #This "Median" peakset has duplicate samples removed (in excel). Some samples had both CD4 and CD8 run.
+df<-as.data.frame(TIL)
+median(df$TIL_Number)
+```
+
+## Assigning TIL High and Low to patient samples 
+TIL low are those with below the median number of TIL infused (in 10 billions). Median number of TIL infused = 'r median(df$TIL_number)'
+
+
+```{r assign TIL group, echo=FALSE}
+samples <- read.csv("diffbind/peakset.csv")
+chip <- dba(sampleSheet = samples)
+chip #113100 peaks that overlap in at least two of the samples
+dba.plotHeatmap(chip, margin=2, colScheme="BuPu", ColAttributes = c(DBA_REPLICATE, DBA_TISSUE, DBA_FACTOR, DBA_TREATMENT),
+                colSideCols= c("#FFC20A", "#0C7BDC"),
+                 cexRow =1.0, cexCol = 1.0, dendrogram = "column", main="Sample 3 is an outlier") 
+samples<-as.data.frame(samples)
+samples<-samples[-c(3),] #This sample was removed because it was an outlier
+levels(samples$Treatment)<- c(levels(samples$Treatment), "High")
+samples$Treatment[samples$Condition>=5.2e+10] <- "High"
+levels(samples$Treatment)<- c(levels(samples$Treatment), "Low")
+samples$Treatment[samples$Condition<5.2e+10] <- "Low"
+samples
+```
+
+## Creating DBA object for only CD8+ Samples
+
+```{r create DBA object}
+CD8_samples<-samples 
+CD8_samples_filt<-dplyr::filter(CD8_samples, Tissue %in% c("CD8"))
+CD8_samples_final<-CD8_samples_filt[-c(7,10),] #These two samples are removed because they are duplicate patient samples
+chip_CD8<- dba(sampleSheet = CD8_samples_final)
+```
+
+##Reads in peaks must be counted for each sample
+bScaleControl is used to correct for possibility that the control file is larger than a sample file
+bSubControl is used to subtract reads that appear in the control sample (aka background reads)
+
+```{r count peak reads}
+CD8_samples_final_count <- dba.count(chip_CD8, minOverlap = 2, bScaleControl = TRUE, bSubControl = TRUE, bParallel = TRUE)
+```
+
+##Normalize the reads
+Normalizing reads in diffbind is not as simple as it is in DESeq2. For ChIP and ATAC experiments, one cannot always simply assume that the libraries will be the same size (this can be influenced by the ChIP/ATAC efficiency). Furthermore, there are conditions in which the library may fundamentally differ between conditions (for instance, when looking at HDACi-treated samples vs control). Therefore, one must decide to use either the full library size or the reads in peaks (RIP). It is probably best to evaluate both and look at the resultant MA-plots to determine which to use. 
+
+```{r normalize reads}
+chip_CD8_norm <- dba.normalize(CD8_samples_final_count, method = DBA_DESEQ2, normalize = DBA_NORM_NATIVE, library= DBA_LIBSIZE_FULL)
+```
+
+##Identify differentially bound (or in this case acetylated) sites
+Different methods can be used (i.e., DESeq2 or EDGER). bBlacklist removes blacklisted regions and bGreylist removes regions that are overepresented in the control files.
+
+```{r running the contrasts}
+CD8_Results <- dba.analyze(chip_CD8_norm, method = DBA_DESEQ2, bBlacklist = TRUE, bGreylist=TRUE, bParallel = TRUE, design= "~Treatment + Replicate") #this contrast controls for group bias
+```
+
+##Creating reports from the contrasts
+I had to use bFlip to reverse the order of TIL high compared with TIL low. I like to export all of the results and then filter them manually. 
+
+```{r chip reports}
+CD8_Report<-dba.report(CD8_Results, th=1, contrast = 1, bFlip = TRUE)
+filtered_1<- CD8_Report[((CD8_Report$Fold < -0.58 & CD8_Report$FDR < 0.1) | (CD8_Report$Fold > 0.58 & CD8_Report$FDR < 0.1)),]
+visualize_dataset_CD8 <- dba.report(CD8_Results, contrast=1, th=1, bFlip = TRUE, bCount=TRUE)
+```
+
+##PCA plot
+I like to first create a PCA plot to determine if any differences exist between the two groups being compared. Here, I wanted to see if there were differences between the acetylation between TIL high and TIL low patients. 
+
+```{r PCA plot}
+pca <- dba.plotPCA(CD8_Results, attributes = DBA_TREATMENT, vColors = c("blue", "red"), contrast=1, th=.1)
+pdf("PCA.pdf", height = 8, width = 8)
+print(pca)
+dev.off()
+```
+
+##Peak annotation
+I determined that the best way to annotate the panH3ac ChIP peaks was to use chipenrich, which obstensibly is for pathway analysis of chip-seq data. However, it does have a annotation function built in which I have co-opted here to annotate the otherwise very difficult to annotate these peaks (these peaks are difficult to annotate as they can appear as both broad and narrow, at distal/proximal sites to the TSS, and at the gene body).
+```{r}
+result_test=broadenrich(peaks = as.data.frame(CD8_Report), genome = 'hg38', genesets = 'kegg_pathway', locusdef = "nearest_gene", qc_plots = TRUE, out_name = NULL, n_cores = 8)
+results_test.ce = result_test$results
+print(results_test.ce[1:35,1:5])
+gobp <- result_test$results[1:10,1:5]
+results_test.ce = result_test$peaks
+peaks<-results_test.ce[,1:11]
+
+peaks$merged <- str_c(peaks$chr,";", peaks$peak_start)
+CD8_peaks <- as.data.frame(visualize_dataset_CD8)
+CD8_peaks$merged <- str_c(CD8_peaks$seqnames,";", CD8_peaks$start)
+
+merged_datasets <- merge(peaks, CD8_peaks , by="merged")
+filtered_merged_datasets <- merged_datasets[((merged_datasets$Fold < -0.58 & merged_datasets$FDR < 0.1) | (merged_datasets$Fold > 0.58 & merged_datasets$FDR < 0.1)) ,]
+write.csv(merged_datasets,"full_CD8_anno.csv", row.names = TRUE)
+write.csv(filtered_merged_datasets,"filtered_CD8_anno.csv", row.names = TRUE)
+```
+
+##Heatmap of the DACs
+
+```{r, heatmap}
+
+heatmap_CD8 <- heatmap.2(as.matrix(filtered_merged_datasets[24:ncol(filtered_merged_datasets)]), cexRow = 0.6, cexCol = 0.6, scale="row", trace = "none", margins = c(7,5), key = FALSE, labRow = filtered_merged_datasets$gene_symbol, Rowv = TRUE, Colv = TRUE,
+          , col=rev(brewer.pal(11,"RdBu")), ColSideColors = c("orange", "orange", "orange", "orange", "orange", "orange", 
+                                                              "orange", "orange", "light green", "orange", "light green", "light green", "light green", 
+                                                              "light green", "light green", "light green", "light green"))
+pdf("Heatmap", width = 8, height = 8)
+print(heatmap_CD8)
+dev.off()
+```
+
+##Volcano of the CD8+ DACs
+
+```{r volcano plot}
+keyvals <- ifelse(
+  merged_datasets$Fold < -0.5 & merged_datasets$FDR < 0.1, 'red2',
+  ifelse(merged_datasets$Fold > 0.50 & merged_datasets$FDR < 0.1, 'red2',
+         'grey30'))
+keyvals[is.na(keyvals)] <- 'grey30k'
+names(keyvals)[keyvals == 'red2'] <- 'Hypoacetylated'
+names(keyvals)[keyvals == 'grey30'] <- 'Non-sig'
+names(keyvals)[keyvals == 'royalblue'] <- 'Hyperacetylated'
+
+
+volcano_plot <- EnhancedVolcano(merged_datasets,
+                lab = merged_datasets$gene_symbol,
+                x = "Fold",
+                y = "FDR", ylab = bquote(~-Log[10] ~ FDR),
+                title = "CD8 TIL Low vs TIL High", 
+                subtitle = "", subtitleLabSize = 0.01,
+                cutoffLineType = 'blank',
+                colCustom = keyvals, legendPosition = 'right', 
+                xlim = c(-2,2), ylim = c(0, 4.1),
+                legendLabSize = 11, legendIconSize = 2, caption = "", captionLabSize = 0.0000001, 
+                pCutoff = 0.1,FCcutoff = 0.58, labSize = 5, drawConnectors = TRUE, arrowheads=FALSE, max.overlaps = 25, 
+                border = 'full', borderWidth = 0.5, borderColour = 'black')
+volcano_plot
+
+pdf("ChIP CD8 Volcano Plot.pdf", width = 8, height = 8)
+print(volcano_plot)
+dev.off()
+```
+
+##Dot plots of key genes
+Based on results from ssGSEA (which were calculated using python), DACs are suggestive of altered CD8+ activation. Therefore, I focused on the DACs that are known to be involved in T-cell activation
+```{r activation dot plots}
+
+df_list <- filtered_merged_datasets %>% filter((gene_symbol == "APOBEC3G" | gene_symbol == "SSH1" | gene_symbol == "CD200" | gene_symbol == "ZEB2" | gene_symbol == "PTPRK"))
+df_list <- df_list[-3,] 
+
+df_list_long <- df_list %>% pivot_longer(cols=c(24:40),
+                                       names_to='Sample',
+                                       values_to='Counts')
+
+df_list_long <- df_list_long %>%
+  mutate(TIL = case_when(Sample == "X5" ~ "high", Sample == "X6" ~ "high", Sample == "X7" ~ "low", Sample == "X8" ~ "high", Sample == "X9" ~ "low", Sample == "X10" ~ "low", 
+                        Sample == "X16" ~ "high", Sample == "X17" ~ "high",  Sample == "X19" ~ "low", Sample == "X20" ~ "high", 
+                         Sample == "X21" ~ "high", Sample == "X22" ~ "low", Sample == "X23" ~ "high", Sample == "X24" ~ "low", 
+                         Sample == "X25" ~ "low", Sample == "X26" ~ "low", Sample == "X27" ~ "high"))
+
+
+SSH1 <- df_list_long %>% dplyr::filter(gene_symbol == "SSH1")
+SSH1_mean <- SSH1 %>% 
+  group_by(TIL) %>% 
+  summarise(mean_val = mean(Counts))
+
+
+ZEB2 <- df_list_long %>% dplyr::filter(gene_symbol == "ZEB2")
+ZEB2_mean <- ZEB2 %>% 
+  group_by(TIL) %>% 
+  summarise(mean_val = mean(Counts))
+
+APOBEC3G <- df_list_long %>% dplyr::filter(gene_symbol == "APOBEC3G")
+APOBEC3G_mean <- APOBEC3G %>% 
+  group_by(TIL) %>% 
+  summarise(mean_val = mean(Counts))
+
+PTPRK<- df_list_long %>% dplyr::filter(gene_symbol == "PTPRK")
+PTPRK_mean <- PTPRK %>% 
+  group_by(TIL) %>% 
+  summarise(mean_val = mean(Counts))
+
+CD200<- df_list_long %>% dplyr::filter(gene_symbol == "CD200")
+CD200_mean <- CD200 %>% 
+  group_by(TIL) %>% 
+  summarise(mean_val = mean(Counts))
+
+
+
+dotplot_CD8 <- ggplot(df_list_long, aes(gene_symbol, Counts)) + geom_point(aes(color = TIL), position = position_jitterdodge(dodge.width = 0.9), size = 3.0) +
+  scale_color_manual(values = c("blue", "red")) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(axis.text.x = element_text(vjust = 0.5, face = "italic", size = 15, color = "black")) + labs(x = "Gene", y = "Normalized Counts") + 
+  theme(axis.text.y = element_text(size = 15, color = "black")) + theme(legend.text = element_text(size = 8)) + theme(axis.title.y = element_text(size = 18)) +
+  geom_vline(xintercept = c(1.5, 2.5, 3.5, 4.5), color= "grey") +  
+  theme(panel.border = element_rect(fill=NA, colour = "black", size=.75)) +
+  geom_segment(aes(x = .5,xend = .98, y=35.8, yend = 35.8), color = "blue", size = .65) + geom_segment(aes(x = 1.05,xend = 1.45, y=13.3, yend = 13.3), color = "red", size = 0.65) +
+  geom_segment(aes(x = 1.55,xend = 1.98, y=85.9, yend = 85.9), color = "blue", size = .65) + geom_segment(aes(x = 2.05,xend = 2.45, y=36.6, yend = 36.6), color = "red", size = 0.65) +
+  geom_segment(aes(x = 2.55,xend = 2.98, y=39.2, yend = 39.2), color = "blue", size = .65) + geom_segment(aes(x = 3.05,xend = 3.45, y=15.0, yend = 15.0), color = "red", size = 0.65) + 
+  geom_segment(aes(x = 3.55,xend = 3.98, y=20.9, yend = 20.9), color = "blue", size = .65) + geom_segment(aes(x = 4.05,xend = 4.45, y=9.52, yend = 9.52), color = "red", size = 0.65) + 
+  geom_segment(aes(x = 4.55,xend = 4.98, y=30.7, yend = 30.7), color = "blue", size = .65) + geom_segment(aes(x = 5.05,xend = 5.45, y=8.37, yend = 8.37), color = "red", size = 0.65) 
+dotplot_CD8
+
+pdf("CD8 Target Genes Dotplot.pdf", width=8, height=8)  
+print(dotplot_CD8)
+dev.off()
+
+
+```
+
+##Graphing acetylation score
+Clearly acetylation at genes associated with T-cell activation is associated with TIL high individuals, however, I wanted to also determine if this acetylation was also associated with overall survival. Therefore, I calculated an "acetylation score" for each sample and then plotted this with overall survival.
+
+```{r acetylation score}
+#Making an enrichment score for the CD8 DAGs
+
+sorting <- filtered_merged_datasets 
+
+#Selecting only the needed columns
+sorting <- sorting %>% dplyr::select(gene_symbol, X5, X6, X7, X8, X9, X10, X16, X17, 
+                                     X19, X20, X21, X22, X23, X24, X25, X26, X27)
+avg <- sorting %>% rowwise() %>% mutate(average = mean(c(X5, X6, X7, X8, X9, X10, X16, X17, 
+                                                         X19, X20, X21, X22, X23, X24, X25, X26, X27)))
+
+sum(avg$average) #1094.008
+
+weight1 <- avg %>% rowwise() %>% mutate(weight = (average/1094.008))
+weight1 <- as.data.frame(weight1)
+weight = weight1$weight
+
+scale2 <- function(x, na.rm = FALSE) (x * weight)
+computed <- weight1 %>% mutate_at(c("X5", "X6", "X7", "X8", "X9", "X10", 
+                                     "X16", "X17", "X19", "X20", "X21", "X22", "X23", "X24",
+                                     "X25", "X26", "X27"), scale2)
+computed <- computed[,-1]
+
+t_set <- t(computed)
+t_set <- as.data.frame(t_set)
+sample_sums <- t_set %>% mutate(sample_sum = rowSums(t_set))
+
+sample_sums <- sample_sums[-c(18,19),]
+
+#Adding in the TIL number data
+TIL_num <- CD8_samples_filt$Condition
+TIL_num <- as.data.frame(TIL_num)
+TIL_num <- format(TIL_num$TIL_num, scientific = FALSE)
+TIL_num <- TIL_num[-c(7, 10)]
+sample_sums %<>% mutate(TIL_num = TIL_num)
+sample_sums$TIL_num <- as.numeric(sample_sums$TIL_num)
+
+#Adding in the OS data
+OS <- c(88, 19, 22, 112, 10, 4, 125, 107, 7, 
+        87, 80, 9, 89, 10, 9, 21, 92)
+
+
+#Adding in the censored data
+cens <- c(1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 1, 1, 1, 0)
+sample_sums <- sample_sums %>% mutate(cens = cens)
+
+coxph_model_SCORE_OS = coxph(Surv(OS, cens) ~ sample_sum, data = sample_sums) 
+
+
+pt1 <- ggplot(sample_sums, aes(x=sample_sum, y=OS, shape=as.factor(cens))) +
+  geom_point(size=5.5)  + 
+  theme_classic() + 
+  labs(shape = "Censoring") +
+  xlab(label = "Acetylation Score") +
+  ylab(label = "Overall Survival (Months)") +
+  scale_shape_discrete(name = "Censoring", labels = c("Censored", "Not Censored")) +
+  scale_shape_manual(values=c(1, 19)) +
+  annotate("text", size = 6, x = 30, y = 100, label = paste("R² =", round(summary(coxph_model_SCORE_OS)$rsq[1], 2))) +
+  annotate("text", size = 6, x = 30, y = 95, label = paste("p =", round(summary(coxph_model_SCORE_OS)$waldtest[3], 5))) + 
+  theme(axis.text = element_text(size = 15, color = "black"), axis.title = element_text(size = 20),
+        legend.text = element_text(size = 15), legend.title = element_text(size = 15), 
+        legend.position = c(0.90, 0.5))
+pt1
+
+pdf("OSvsAcetylation Score.pdf", width = 8, height = 8)
+print(pt1)
+dev.off()
+```
+
